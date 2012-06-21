@@ -1,0 +1,356 @@
+#!/usr/bin/bash
+#
+# derek@joyent.com
+# MySQLgauge does simple,complex,readonly,writeonly testing.
+# Version 2
+#
+# There are two requremnets:
+# 1) sysbench (pkgin install sysbench)
+# 2) Privileges for a user to access that database from the client (grant all on mgtest.* to 'mgtest'@'%' identified by 'pass123'; flush privileges;).
+
+usage() {
+cat << EOF
+
+MySQLgauge - Version 2
+
+Usage: $0 [options] hostname type
+
+Arguments:
+
+    hostname           Hostname or IP of the MySQL server being tested.
+    type               Type of MySQL test to perform.  Tests available:
+                       ro_simple,ro_complex,rw_simple,rw_complex,
+                       wo_simple,wo_complex,insert
+
+Options:
+
+    -c <clients>       Number of clients to connect separated by commas.
+                       eg: 8,16,32,64.  [32]
+    -s <table size>    Number of rows in the table(s) being tested.  [500000]
+    -n <num tables>    Number of tables in test to perform.  [32]
+    -m <max requests>  Maximum amount of requests to send.  [50000]
+    -d <delay>         Number of seconds delay between each client test.  [120]
+
+EOF
+exit 2;
+}
+
+#	  ro_simple      - read only simple queries (simple primary key).
+#	  ro_complex     - read only complex queries (point,range,sum,orderby,distinct).
+#	  rw_simple 	 - read/write simple queries (point,range,sum,orderby,distinct,update,delete). 
+#	  rw_complex     - read/write complex queries (point,range,sum,orderby,distinct,update,delete). 
+#	  wo_simple      - write only simple queries (insert,delete).
+#	  wo_complex     - write only complex queries (update,delete,insert).
+
+while getopts "c:s:n:m:d:" OPTION; do
+	case $OPTION in
+		c)
+			TEST_CLIENTS=$OPTARG;
+			;;
+		s)
+			TEST_TABLESIZE=$OPTARG;
+			;;
+		n)
+			TEST_TABLECOUNT=$OPTARG;
+			;;
+		m)	
+			TEST_MAXREQUESTS=$OPTARG;
+			;;
+		d)
+			TEST_DELAY=$OPTARG;
+			;;
+		*)
+			usage;
+			exit 2;
+	esac
+done
+
+shift $(($OPTIND - 1))
+if [[ $# = 2 ]]; then
+	MYSQL_HOST=$1;
+	TEST_TYPE=$2;
+else
+	usage;
+fi
+
+if [[ ${TEST_CLIENTS} ]]; then
+	[[ ! ${TEST_CLIENTS} =~ ^([0-9]+([0-9]+)*,*)+$ ]] && usage;
+	[[ ${TEST_CLIENTS} == *, ]] && usage;
+	CLIENTSSTRING=$(echo ${TEST_CLIENTS} | sed 's/,/ /g');
+else
+	TEST_CLIENTS="32";
+	CLIENTSSTRING="32";
+fi
+
+TEST_TABLESIZE=${TEST_TABLESIZE:-500000};
+TEST_TABLECOUNT=${TEST_TABLECOUNT:-16};
+TEST_MAXREQUESTS=${TEST_MAXREQUESTS:-50000};
+TEST_DELAY=${TEST_DELAY:-120};
+
+#echo "CLIENTS: ${CLIENTSSTRING}";
+#echo "MAXREQUESTS: ${TEST_MAXREQUESTS}";
+#echo "TBLSIZE: ${TEST_TABLESIZE}";
+#echo "TBLCOUNT: ${TEST_TABLECOUNT}";
+#echo "MAXREQUESTS: ${TEST_MAXREQUESTS}";
+#echo "DELAY: ${TEST_DELAY}";
+#echo "BLAH: ${MYSQL_HOST} ${TEST_TYPE}";
+#exit 77;
+
+BINDIR=$(cd ${0%/*} && pwd -P);
+HOME="${BINDIR%/*}";
+TMPDIR="${HOME}/tmp";
+LOGDIR="${HOME}/logs";
+TESTSDIR="${HOME}/tests";
+TMPFILE="${TMPDIR}/.tmp.$$";
+MYSQL_USER="mgtest";
+MYSQL_PASS="pass123";
+
+mysql_dochecks() {
+	# Check if sysbench is in PATH.
+	hash sysbench &>/dev/null
+	[[ $? -eq 1 ]] && echo "ERROR - sysbench was not found in your PATH." && exit 2;
+
+	# Check if mysql is in PATH.
+	hash mysql &>/dev/null
+	[[ $? -eq 1 ]] && echo "ERROR - mysql was not found in your PATH." && exit 2;
+
+	# Check that privileges have been setup.
+	CHECK=$(mysql -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} -e "select version();" 2>/dev/null);
+	[[ $? -eq 1 ]] && echo "ERROR - Can't connect to ${MYSQL_HOST} with the user/pass.  Check that MySQL privileges have been setup on the remote server." && exit 2;
+
+	# Check if database exists.  Do prepare if it doesn't.
+	CHECK=$(mysql -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} -e "use mgtest;" 2>/dev/null);
+	[[ $? -eq 1 ]] && PREPARE="YES";
+
+	# Check if the number of tables in the database is the table count we specified.
+	if [[ -z ${PREPARE} ]]; then
+		CHECK=$(mysql -sN -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} -e "use mgtest; show tables" | wc -l);
+		[[ ${CHECK} != ${TEST_TABLECOUNT} ]] && echo -ne "ERROR - The number of tables in mgtest (${CHECK}) isn't what you specified to test (${TEST_TABLECOUNT}).\n        You may need to delete the mgtest database and run again if you want to\n        test a different number of tables.\n" && exit 2;
+	fi
+	
+	# Get remote server MySQL version
+	VERSION=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} version | grep "Server version" | awk '{ print $3 }');
+	LOGFILE="${MYSQL_HOST}-MySQL-${VERSION}.log";
+
+	# Get remote server uptime
+	UPTIME2=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} status | awk '{ print $2 }');
+	UPTIME=$(echo - | awk -v "S=${UPTIME2}" '{printf "%dh %dm %ds",S/(60*60),S%(60*60)/60,S%60}');
+
+	# Get remote server MySQL innodb_buffer_pool_size
+	INNODB_BUFFER_POOL_SIZE=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} variables | grep innodb_buffer_pool_size | awk '{ print $4/1024/1024 "M" }');
+
+	# Get remote server MySQL innodb_log_file_size
+	INNODB_LOG_FILE_SIZE=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} variables | grep innodb_log_file_size | awk '{ print $4/1024/1024 "M" }');
+
+	# Get remote server MySQL innodb_log_buffer_size
+	INNODB_LOG_BUFFER_SIZE=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} variables | grep innodb_log_buffer_size | awk '{ print $4/1024/1024 "M" }');
+
+	# Get remote server MySQL innodb_flush_log_at_trx_commit
+	INNODB_FLUSH_LOG_AT_TRX_COMMIT=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} variables | grep innodb_flush_log_at_trx_commit | awk '{ print $4 }');
+
+	# Get remote server MySQL query cache type
+	QUERY_CACHE_TYPE=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} variables | grep query_cache_type | awk '{ print $4 }');
+
+	# Get remote server MySQL query cache size
+	[[ ${QUERY_CACHE_TYPE} = "ON" ]] && QUERY_CACHE_SIZE=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} variables | grep query_cache_size | awk '{ print $4/1024/1024 "M" }');
+
+	# Get remote server MySQL autocommit
+	AUTOCOMMIT=$(mysqladmin -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} variables | grep autocommit | awk '{ print $4 }');
+}
+
+mysql_printheader() {
+	# Print summary.
+	printf "\n%-54s %-25s\n" "MYSQL INFORMATION" "TEST INFORMATION";
+	printf "%-77s\n" "--------------------------------------------------------------------------------";
+	printf "%-26s %-25s %-15s %-11s\n" "Host" "${MYSQL_HOST}" "Test Type" "${DESC}";
+	printf "%-26s %-25s %-15s %-11s\n" "Version" "${VERSION}" "Clients" "${TEST_CLIENTS}";
+	printf "%-26s %-25s %-15s %-11s\n" "Uptime" "${UPTIME}" "Max Requests" "${TEST_MAXREQUESTS}";
+	printf "%-26s %-25s %-15s %-11s\n" "InnoDB Buffer Pool Size" "${INNODB_BUFFER_POOL_SIZE}" "Table Size" "${TEST_TABLESIZE}";
+	printf "%-26s %-25s %-15s %-11s\n" "InnoDB Log File Size" "${INNODB_LOG_FILE_SIZE}" "Table Count" "${TEST_TABLECOUNT}";
+	printf "%-26s %-25s %-15s %-11s\n" "InnoDB Log Buffer Size" "${INNODB_LOG_BUFFER_SIZE}" "Delay" "${TEST_DELAY}";
+	printf "%-26s %-25s\n" "InnoDB Flush TRX Commit" "${INNODB_FLUSH_LOG_AT_TRX_COMMIT}";
+	printf "%-26s %-25s\n" "Query Cache" "${QUERY_CACHE_TYPE}";
+	[[ ${QUERY_CACHE_TYPE} = "ON" ]] && printf "%-26s %-25s\n" "Query Cache Size" "${QUERY_CACHE_SIZE}";
+	printf "%-26s %-25s\n" "Auto Commit" "${AUTOCOMMIT}";
+
+	printf "\n";
+
+	# Print actions header.
+	printf "%-16s %-42s %-12s %-10s\n" "HOST/IP" "ACTION" "RW OPS/SEC" "TRX/SEC";
+	printf "%-77s\n" "--------------------------------------------------------------------------------";
+}
+
+sysbench_runprepare() {
+	# Create and run prepare on mgtest database.
+	CLIENT_NUMCPUS=$(kstat -p unix:0:system_misc:ncpus | awk '{ print $2 }');
+	printf "%-16s %-43s" "${MYSQL_HOST}" "Preparing database with ${TEST_TABLESIZE} rows.."
+
+	mysql -u${MYSQL_USER} -p${MYSQL_PASS} -h ${MYSQL_HOST} -e "create database mgtest;";
+
+	${BINDIR}/sysbench --num-threads=${CLIENT_NUMCPUS} --test=${TESTSDIR}/parallel_prepare.lua --mysql-host=${MYSQL_HOST} --mysql-user=${MYSQL_USER} --mysql-password=${MYSQL_PASS} --mysql-db=mgtest --oltp-table-size=${TEST_TABLESIZE} --oltp-tables-count=${TEST_TABLECOUNT} run > ${TMPFILE};
+
+	OPERATIONS=$(tail -20 ${TMPFILE} | grep "write requests:" | cut -d\( -f2 | awk -F\. '{ print $1 }');
+	rm ${TMPFILE};
+
+	printf "%-7s\n" "${OPERATIONS}";
+}
+
+sysbench_runall() {
+	COUNT=0;
+	TESTS_TOTAL=$(echo "${CLIENTSSTRING}" | wc -w);
+	for i in ${CLIENTSSTRING}; do
+		printf "%-16s %-43s" "${MYSQL_HOST}" "Doing $i client ${DESC} test.."
+        	cat >> ${LOGDIR}/${LOGFILE} <<EOF
+==> ${MYSQL_HOST}-MySQL-${VERSION}
+==> threads: $i max-requests: ${TEST_MAXREQUESTS} type: ${TEST_TYPE} table-size: ${TEST_TABLESIZE} prepared-statements: disabled
+
+EOF
+
+		# Run sysbench.
+		${BINDIR}/sysbench --num-threads=$i ${ARGUMENTS} >> ${LOGDIR}/${LOGFILE};
+		OPERATIONS=$(tail -20 ${LOGDIR}/${LOGFILE} | grep "read/write requests:" | cut -d\( -f2 | awk -F\. '{ print $1 }');
+		TRANSACTIONS=$(tail -20 ${LOGDIR}/${LOGFILE} | grep "transactions:" | cut -d\( -f2 | awk -F\. '{ print $1 }');
+
+		# Figure up averages.
+		[[ ${OPERATIONS} != "0" ]] && OPERATIONS_AVG=$((${OPERATIONS_AVG} + ${OPERATIONS}));
+		[[ ${TRANSACTIONS} != "0" ]] && TRANSACTIONS_AVG=$((${TRANSACTIONS_AVG} + ${TRANSACTIONS}));
+		((COUNT++));
+
+		# Print results.
+		[[ ${TRANSACTIONS} = "0" ]] && printf "%-12s\n" "${OPERATIONS}" || (printf "%-13s" "${OPERATIONS}" && printf "%-10s\n" "${TRANSACTIONS}");
+
+		# Delay if more than one test.
+		[[ ${COUNT} -ne ${TESTS_TOTAL} ]] && sleep ${TEST_DELAY};
+	done
+
+	# Print average results.
+	if [[ ${COUNT} -gt 1 ]] && [[ ${TRANSACTIONS} = "0" ]]; then
+		printf "%-16s %-42s %-12s\n" "${MYSQL_HOST}" "Doing test average calculation.." "$((${OPERATIONS_AVG}/${COUNT}))"
+	elif [[ ${COUNT} -gt 1 ]]; then
+		printf "%-16s %-42s %-12s %-10s\n" "${MYSQL_HOST}" "Doing test average calculation.." "$((${OPERATIONS_AVG}/${COUNT}))" "$((${TRANSACTIONS_AVG}/${COUNT}))";
+	fi
+
+	[[ ${TRANSACTIONS} = "0" ]] && printf "%-16s %-42s %-12s\n" "${MYSQL_HOST}" "Doing test average calculation.." "$((${OPERATIONS_AVG}/${COUNT}))" || \
+	printf "%-16s %-42s %-12s %-10s\n" "${MYSQL_HOST}" "Doing test average calculation.." "$((${OPERATIONS_AVG}/${COUNT}))" "$((${TRANSACTIONS_AVG}/${COUNT}))";
+	
+}
+
+
+# Determine type of test and run.
+case ${TEST_TYPE} in
+	ro_simple)
+		# Setup arguments.
+		DESC="RO simple";
+		ARGUMENTS="--max-requests=${TEST_MAXREQUESTS} --test=${TESTSDIR}/oltp_simple.lua --mysql-host=${MYSQL_HOST} --mysql-user=${MYSQL_USER} --mysql-password=${MYSQL_PASS} --mysql-db=mgtest --oltp-table-size=${TEST_TABLESIZE} --oltp-tables-count=${TEST_TABLECOUNT} --db-ps-mode=disable run";
+
+		# Do MySQL and various checks.
+		mysql_dochecks;
+
+		# Print header.
+		mysql_printheader;
+
+		# Prepare database with rows if needed.
+		[[ ${PREPARE} ]] && sysbench_runprepare;
+
+		# Run sysbench tests.
+		sysbench_runall;
+		;;
+
+	ro_complex)
+		# Setup arguments.
+		DESC="RO complex";
+		ARGUMENTS="--max-requests=${TEST_MAXREQUESTS} --test=${TESTSDIR}/oltp.lua --mysql-host=${MYSQL_HOST} --mysql-user=${MYSQL_USER} --mysql-password=${MYSQL_PASS} --mysql-db=mgtest --oltp-table-size=${TEST_TABLESIZE} --oltp-tables-count=${TEST_TABLECOUNT} --oltp-test-mode=complex --oltp-read-only=on --oltp-skip-trx=on --oltp-point-selects=5 --oltp-simple-ranges=3 --oltp-sum-ranges=3 --oltp-order-ranges=3 --oltp-distinct-ranges=2 --db-ps-mode=disable run";
+
+		# Do MySQL and various checks.
+		mysql_dochecks;
+
+		# Print header.
+		mysql_printheader;
+
+		# Prepare database with rows if needed.
+		[[ ${PREPARE} ]] && sysbench_runprepare;
+
+		# Run sysbench tests.
+		sysbench_runall;
+		;;
+
+	rw_complex)
+		# Setup arguments.
+		DESC="RW complex";
+		ARGUMENTS="--max-requests=${TEST_MAXREQUESTS} --test=${TESTSDIR}/oltp.lua --mysql-host=${MYSQL_HOST} --mysql-user=${MYSQL_USER} --mysql-password=${MYSQL_PASS} --mysql-db=mgtest --oltp-table-size=${TEST_TABLESIZE} --oltp-tables-count=${TEST_TABLECOUNT} --oltp-test-mode=complex --oltp-point-selects=2 --oltp-simple-ranges=2 --oltp-sum-ranges=2 --oltp-order-ranges=2 --oltp-distinct-ranges=2 --oltp-index-updates=2 --oltp-non-index-updates=2 --db-ps-mode=disable run";
+
+		# Do MySQL and various checks.
+		mysql_dochecks;
+
+		# Print header.
+		mysql_printheader;
+
+		# Prepare database with rows if needed.
+		[[ ${PREPARE} ]] && sysbench_runprepare;
+
+		# Run sysbench tests.
+		sysbench_runall;
+		;;
+
+	wo_simple)
+		# Setup arguments.
+		DESC="WO simple";
+		ARGUMENTS="--max-requests=${TEST_MAXREQUESTS} --test=${TESTSDIR}/oltp.lua --mysql-host=${MYSQL_HOST} --mysql-user=${MYSQL_USER} --mysql-password=${MYSQL_PASS} --mysql-db=mgtest --oltp-table-size=${TEST_TABLESIZE} --oltp-tables-count=${TEST_TABLECOUNT} --oltp-test-mode=complex --oltp-point-selects=0 --oltp-simple-ranges=0 --oltp-sum-ranges=0 --oltp-order-ranges=0 --oltp-distinct-ranges=0 --oltp-index-updates=2 --oltp-non-index-updates=1 --db-ps-mode=disable run";
+
+		# Do MySQL and various checks.
+		mysql_dochecks;
+
+		# Print header.
+		mysql_printheader;
+
+		# Prepare database with rows if needed.
+		[[ ${PREPARE} ]] && sysbench_runprepare;
+
+		# Run sysbench tests.
+		sysbench_runall;
+		;;
+
+	wo_complex)
+		# Setup arguments.
+		DESC="WO complex";
+		ARGUMENTS="--max-requests=${TEST_MAXREQUESTS} --test=${TESTSDIR}/oltp.lua --mysql-host=${MYSQL_HOST} --mysql-user=${MYSQL_USER} --mysql-password=${MYSQL_PASS} --mysql-db=mgtest --oltp-table-size=${TEST_TABLESIZE} --oltp-tables-count=${TEST_TABLECOUNT} --oltp-test-mode=complex --oltp-point-selects=0 --oltp-simple-ranges=0 --oltp-sum-ranges=0 --oltp-order-ranges=0 --oltp-distinct-ranges=0 --oltp-index-updates=4 --oltp-non-index-updates=5 --db-ps-mode=disable run";
+
+		# Do MySQL and various checks.
+		mysql_dochecks;
+
+		# Print header.
+		mysql_printheader;
+
+		# Prepare database with rows if needed.
+		[[ ${PREPARE} ]] && sysbench_runprepare;
+
+		# Run sysbench tests.
+		sysbench_runall;
+		;;
+
+	insert)
+		# Setup arguments.
+		DESC="insert";
+		ARGUMENTS="--max-requests=${TEST_MAXREQUESTS} --test=${TESTSDIR}/insert.lua --mysql-host=${MYSQL_HOST} --mysql-user=${MYSQL_USER} --mysql-password=${MYSQL_PASS} --mysql-db=mgtest --oltp-table-size=${TEST_TABLESIZE} --oltp-tables-count=${TEST_TABLECOUNT} --db-ps-mode=disable run";
+
+		# Do MySQL and various checks.
+		mysql_dochecks;
+
+		# Print header.
+		mysql_printheader;
+
+		# Prepare database with rows if needed.
+		[[ ${PREPARE} ]] && sysbench_runprepare;
+
+		# Run sysbench tests.
+		sysbench_runall;
+		;;
+	*)
+		usage;
+		exit 2;
+		;;
+esac
+
+echo -ne "\nDetailed results are in ${LOGDIR}/${LOGFILE}.\n\n";
+
+exit;

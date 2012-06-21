@@ -1,0 +1,9 @@
+* Version 1
+- Initial release.
+
+* Version 2
+- Clean up vars, functions.
+- Make testing of multiple types in one run.
+- Put dataset sizes,bufferpool sizes.
+- More stats.
+- More summary information.
