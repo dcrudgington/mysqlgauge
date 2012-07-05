@@ -160,9 +160,9 @@ mysql_dochecks() {
 
 mysql_printheader() {
 	# Print summary.
-	printf "\n%-54s %-25s\n" "MYSQL INFORMATION" "TEST INFORMATION";
+	printf "\n%-52s %-23s\n" "MYSQL INFORMATION" "TEST INFORMATION";
 	printf "%-77s\n" "--------------------------------------------------------------------------------";
-	printf "%-26s %-25s %-15s %-11s\n" "Host" "${MYSQL_HOST}" "Test Type" "${DESC}";
+	printf "%-26s %-25s %-15s %-11s\n" "Host" "${MYSQL_HOST:0:23}" "Test Type" "${DESC}";
 	printf "%-26s %-25s %-15s %-11s\n" "Version" "${VERSION}" "Clients" "${TEST_CLIENTS}";
 	printf "%-26s %-25s %-15s %-11s\n" "Uptime" "${UPTIME}" "Max Requests" "${TEST_MAXREQUESTS}";
 	printf "%-26s %-25s %-15s %-11s\n" "InnoDB Buffer Pool Size" "${INNODB_BUFFER_POOL_SIZE}" "Table Size" "${TEST_TABLESIZE}";
@@ -176,7 +176,7 @@ mysql_printheader() {
 	printf "\n";
 
 	# Print actions header.
-	printf "%-16s %-42s %-12s %-10s\n" "HOST/IP" "ACTION" "RW OPS/SEC" "TRX/SEC";
+	printf "%-19s %-39s %-12s %-10s\n" "HOST/IP" "ACTION" "RW OPS/SEC" "TRX/SEC";
 	printf "%-77s\n" "--------------------------------------------------------------------------------";
 }
 
@@ -199,7 +199,7 @@ sysbench_runall() {
 	COUNT=0;
 	TESTS_TOTAL=$(echo "${CLIENTSSTRING}" | wc -w);
 	for i in ${CLIENTSSTRING}; do
-		printf "%-16s %-43s" "${MYSQL_HOST}" "Doing $i client ${DESC} test.."
+		printf "%-19s %-40s" "${MYSQL_HOST:0:17}" "Doing $i client ${DESC} test.."
         	cat >> ${LOGDIR}/${LOGFILE} <<EOF
 ==> ${MYSQL_HOST}-MySQL-${VERSION}
 ==> threads: $i max-requests: ${TEST_MAXREQUESTS} type: ${TEST_TYPE} table-size: ${TEST_TABLESIZE} prepared-statements: disabled
